@@ -1,1 +1,37 @@
 [2025-02-17 10:52:19,062 INFO: main: Checking logger for project]
+[2025-02-17 18:56:19,779 INFO: common: yaml file: config/config.yaml loaded successfully]
+[2025-02-17 18:56:19,782 INFO: common: yaml file: params.yaml loaded successfully]
+[2025-02-17 18:57:03,431 INFO: common: yaml file: config/config.yaml loaded successfully]
+[2025-02-17 18:57:03,432 INFO: common: yaml file: params.yaml loaded successfully]
+[2025-02-17 18:57:16,148 INFO: common: yaml file: config/config.yaml loaded successfully]
+[2025-02-17 18:57:16,153 INFO: common: yaml file: params.yaml loaded successfully]
+[2025-02-17 18:57:16,190 INFO: common: yaml file: schema.yaml loaded successfully]
+[2025-02-17 18:57:16,191 INFO: common: created directory at: artifacts]
+[2025-02-17 18:57:16,191 INFO: common: created directory at: artifacts/data_ingestion]
+[2025-02-17 18:57:16,790 INFO: 284695630: artifacts/data_ingestion/data.zip download! with following info: 
+Connection: close
+Content-Length: 23329
+Cache-Control: max-age=300
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox
+Content-Type: application/zip
+ETag: "c69888a4ae59bc5a893392785a938ccd4937981c06ba8a9d6a21aa52b4ab5b6e"
+Strict-Transport-Security: max-age=31536000
+X-Content-Type-Options: nosniff
+X-Frame-Options: deny
+X-XSS-Protection: 1; mode=block
+X-GitHub-Request-Id: 17AA:943AF:BFDDD4:D46873:67B3CCDC
+Accept-Ranges: bytes
+Date: Mon, 17 Feb 2025 23:57:16 GMT
+Via: 1.1 varnish
+X-Served-By: cache-pdk-kfty8610049-PDK
+X-Cache: MISS
+X-Cache-Hits: 0
+X-Timer: S1739836637.577764,VS0,VE222
+Vary: Authorization,Accept-Encoding,Origin
+Access-Control-Allow-Origin: *
+Cross-Origin-Resource-Policy: cross-origin
+X-Fastly-Request-ID: d684727a1e6da3a1e62d08c811889e0b28834e7e
+Expires: Tue, 18 Feb 2025 00:02:16 GMT
+Source-Age: 0
+
+]
