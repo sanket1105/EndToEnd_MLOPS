@@ -18,7 +18,9 @@ Implementing the first end-to-end project from Krish Naiks MLOPS course
 3. Update params.yaml
          -> where we need to provide parameters
 4. Update the entity
+        -> include all the input data points to this file
 5. Update the configuration manager in src config
+        -> whatever path you are using to import and all 
 6. Update the components
 7. Update the pipeline 
 8. Update the main.py
