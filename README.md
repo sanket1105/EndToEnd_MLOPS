@@ -1,6 +1,6 @@
 # EndToEnd_MLOPS
 
-## just go to src/MLOPS folder to get the full jist of the project
+## just go to src/MLOPS_project folder to get the full jist of the project
 
 Implementing the first end-to-end project from Krish Naiks MLOPS course
 
