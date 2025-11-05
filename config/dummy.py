@@ -476,3 +476,122 @@ print("\n✅ Model saved as 'catboost_best_model.cbm'")
 feat_imp = final_model.get_feature_importance(prettified=True)
 feat_imp.to_csv("feature_importance.csv", index=False)
 print("📊 Feature importance saved as 'feature_importance.csv'")
+
+
+## calibration
+
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+
+# =========================================================
+# 🎯 6️⃣➕ CALIBRATION LAYER ON TOP OF CATBOOST (GuideBoost)
+# =========================================================
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+
+print("\n🔧 Applying calibration layers (Isotonic + Platt) on validation data...")
+
+# Base predictions (raw CatBoost probabilities)
+probs = pred_probs
+y_valid = y_true
+
+# --- Isotonic Regression Calibration ---
+iso = IsotonicRegression(out_of_bounds="clip")
+iso.fit(probs, y_valid)
+probs_iso = iso.predict(probs)
+
+# --- Platt Scaling Calibration ---
+platt = LogisticRegression()
+platt.fit(probs.reshape(-1, 1), y_valid)
+probs_platt = platt.predict_proba(probs.reshape(-1, 1))[:, 1]
+
+
+# --- Compare Calibration Metrics ---
+def eval_calibration(y_true, y_pred, label):
+    return {
+        "Model": label,
+        "AUC": roc_auc_score(y_true, y_pred),
+        "Brier": brier_score_loss(y_true, y_pred),
+        "LogLoss": log_loss(y_true, y_pred),
+    }
+
+
+results = []
+results.append(eval_calibration(y_valid, probs, "CatBoost Raw"))
+results.append(eval_calibration(y_valid, probs_iso, "Isotonic Calibrated"))
+results.append(eval_calibration(y_valid, probs_platt, "Platt Calibrated"))
+
+import pandas as pd
+
+print("\n=== Calibration Comparison (Validation Set) ===")
+print(pd.DataFrame(results).round(4))
+
+# --- Calibration Curves ---
+plt.figure(figsize=(7, 5))
+for name, p in [
+    ("CatBoost Raw", probs),
+    ("Isotonic Calibrated", probs_iso),
+    ("Platt Calibrated", probs_platt),
+]:
+    frac_pos, mean_pred = calibration_curve(y_valid, p, n_bins=10)
+    plt.plot(mean_pred, frac_pos, marker="o", label=name)
+
+plt.plot([0, 1], [0, 1], "k--")
+plt.xlabel("Predicted Probability")
+plt.ylabel("True Probability")
+plt.title("Calibration Curves — CatBoost vs Calibrated Models")
+plt.legend()
+plt.show()
+
+# =========================================================
+# 🧠 6️⃣➕➕ DEPLOYABLE CALIBRATION MODEL (ISOTONIC)
+# =========================================================
+print("\n🚀 Building deployable calibrated model (Isotonic)...")
+
+calibrated_model = CalibratedClassifierCV(final_model, method="isotonic", cv="prefit")
+calibrated_model.fit(XTestSelected[feature_cols], y_valid)
+
+# Test-set predictions with calibration
+probs_test_raw = final_model.predict_proba(XTestSelected[feature_cols])[:, 1]
+probs_test_calib = calibrated_model.predict_proba(XTestSelected[feature_cols])[:, 1]
+
+print("\n=== Test Set Comparison ===")
+print(f"Raw AUC:        {roc_auc_score(y_valid, probs_test_raw):.4f}")
+print(f"Calibrated AUC: {roc_auc_score(y_valid, probs_test_calib):.4f}")
+print(f"Raw Brier:      {brier_score_loss(y_valid, probs_test_raw):.4f}")
+print(f"Calib Brier:    {brier_score_loss(y_valid, probs_test_calib):.4f}")
+
+# --- Per-Project Comparison (Raw vs Calibrated) ---
+if "project_name" in XTestSelected.columns:
+    proj_perf = (
+        XTestSelected.assign(
+            pred_raw=probs_test_raw, pred_calib=probs_test_calib, target=y_valid
+        )
+        .groupby("project_name")[["target", "pred_raw", "pred_calib"]]
+        .mean()
+        .rename(
+            columns={
+                "target": "ActualDupRate",
+                "pred_raw": "PredDupRate_Raw",
+                "pred_calib": "PredDupRate_Calib",
+            }
+        )
+    )
+    proj_perf.plot(kind="bar", figsize=(12, 5))
+    plt.title("Actual vs Predicted Duplicate Rate — Raw vs Calibrated (Per Project)")
+    plt.ylabel("Duplicate Rate")
+    plt.show()
+
+# =========================================================
+# 💾 7️⃣ SAVE MODEL & CALIBRATION OBJECTS
+# =========================================================
+import joblib
+
+final_model.save_model("catboost_best_model.cbm")
+joblib.dump(calibrated_model, "catboost_isotonic_calibrated.pkl")
+print("\n✅ Model saved as 'catboost_best_model.cbm'")
+print("✅ Calibrated model saved as 'catboost_isotonic_calibrated.pkl'")
+
+feat_imp = final_model.get_feature_importance(prettified=True)
+feat_imp.to_csv("feature_importance.csv", index=False)
+print("📊 Feature importance saved as 'feature_importance.csv'")
