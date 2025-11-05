@@ -242,3 +242,237 @@ test_pool = Pool(
 # Now you can evaluate your trained CatBoost model on test_pool:
 # preds = model.predict_proba(test_pool)[:, 1]
 # auc = roc_auc_score(test_df["target"], preds, sample_weight=test_df["final_weight"])
+
+
+## catboost
+
+# =========================================================
+#  CATBOOST + OPTUNA + VISUALIZATION PIPELINE
+# =========================================================
+
+import matplotlib.pyplot as plt
+import numpy as np
+import optuna
+import pandas as pd
+import seaborn as sns
+import shap
+from catboost import CatBoostClassifier, Pool
+from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    calibration_curve,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+
+# =========================================================
+# 🧩 1️⃣ INPUTS
+# =========================================================
+# XTrainSelected, XTestSelected should already exist in your workspace.
+# Must include: 'target', 'final_weight', and all feature columns.
+
+target_col = "target"
+weight_col = "final_weight"
+
+# Automatically detect categorical features
+cat_features = XTrainSelected.select_dtypes(
+    include=["object", "category"]
+).columns.tolist()
+for col in [target_col, weight_col]:
+    if col in cat_features:
+        cat_features.remove(col)
+
+# Define features
+exclude_cols = [target_col, weight_col]
+feature_cols = [c for c in XTrainSelected.columns if c not in exclude_cols]
+
+print(f"✅ Detected {len(cat_features)} categorical features.")
+print(f"✅ Using {len(feature_cols)} total features for training.")
+
+# Create CatBoost Pools
+train_pool = Pool(
+    data=XTrainSelected[feature_cols],
+    label=XTrainSelected[target_col],
+    weight=XTrainSelected[weight_col],
+    cat_features=cat_features,
+)
+test_pool = Pool(
+    data=XTestSelected[feature_cols],
+    label=XTestSelected[target_col],
+    weight=XTestSelected[weight_col],
+    cat_features=cat_features,
+)
+
+
+# =========================================================
+# 🎯 2️⃣ OPTUNA OBJECTIVE
+# =========================================================
+def objective(trial):
+    params = {
+        "iterations": trial.suggest_int("iterations", 500, 2000),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+        "depth": trial.suggest_int("depth", 4, 10),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1, 10),
+        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+        "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.6, 1.0),
+        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 100),
+        "bootstrap_type": trial.suggest_categorical(
+            "bootstrap_type", ["Bayesian", "Bernoulli", "MVS"]
+        ),
+        "random_strength": trial.suggest_float("random_strength", 0.1, 10.0),
+        "grow_policy": trial.suggest_categorical(
+            "grow_policy", ["SymmetricTree", "Depthwise", "Lossguide"]
+        ),
+        "loss_function": "Logloss",
+        "eval_metric": "AUC",
+        "random_seed": 42,
+        "verbose": 0,
+    }
+
+    model = CatBoostClassifier(**params)
+    model.fit(
+        train_pool, eval_set=test_pool, early_stopping_rounds=100, use_best_model=True
+    )
+    preds = model.predict_proba(XTestSelected[feature_cols])[:, 1]
+    auc = roc_auc_score(
+        XTestSelected[target_col], preds, sample_weight=XTestSelected[weight_col]
+    )
+    return auc
+
+
+# =========================================================
+# ⚙️ 3️⃣ RUN OPTUNA TUNING
+# =========================================================
+study = optuna.create_study(direction="maximize", study_name="CatBoost_Tuning")
+study.optimize(objective, n_trials=30, show_progress_bar=True)
+
+print("\n🎯 Best trial parameters:")
+for k, v in study.best_trial.params.items():
+    print(f"  {k}: {v}")
+
+# =========================================================
+# 🧠 4️⃣ TRAIN FINAL MODEL
+# =========================================================
+best_params = study.best_trial.params
+best_params.update(
+    {
+        "loss_function": "Logloss",
+        "eval_metric": "AUC",
+        "random_seed": 42,
+        "verbose": 100,
+    }
+)
+
+final_model = CatBoostClassifier(**best_params)
+final_model.fit(
+    train_pool,
+    eval_set=test_pool,
+    early_stopping_rounds=100,
+    use_best_model=True,
+    plot=True,
+)
+
+# =========================================================
+# 📊 5️⃣ EVALUATION
+# =========================================================
+pred_probs = final_model.predict_proba(XTestSelected[feature_cols])[:, 1]
+preds = (pred_probs >= 0.5).astype(int)
+y_true = XTestSelected[target_col]
+weights = XTestSelected[weight_col]
+
+# Metrics
+auc = roc_auc_score(y_true, pred_probs, sample_weight=weights)
+f1 = f1_score(y_true, preds, sample_weight=weights)
+precision = precision_score(y_true, preds, sample_weight=weights)
+recall = recall_score(y_true, preds, sample_weight=weights)
+accuracy = accuracy_score(y_true, preds, sample_weight=weights)
+brier = brier_score_loss(y_true, pred_probs, sample_weight=weights)
+logloss = log_loss(y_true, pred_probs, sample_weight=weights)
+tn, fp, fn, tp = confusion_matrix(y_true, preds).ravel()
+
+print("\n=== FINAL MODEL PERFORMANCE ===")
+print(f"AUC:           {auc:.4f}")
+print(f"Accuracy:      {accuracy:.4f}")
+print(f"F1 Score:      {f1:.4f}")
+print(f"Precision:     {precision:.4f}")
+print(f"Recall:        {recall:.4f}")
+print(f"Brier Score:   {brier:.4f}")
+print(f"Log Loss:      {logloss:.4f}")
+print(f"False Negatives: {fn},  False Positives: {fp}")
+print(f"True Positives:  {tp},  True Negatives: {tn}")
+
+# =========================================================
+# 📈 6️⃣ VISUALIZATIONS
+# =========================================================
+
+# --- Learning Curve ---
+metrics = final_model.get_evals_result()
+plt.figure(figsize=(8, 4))
+plt.plot(metrics["learn"]["AUC"], label="Train AUC")
+plt.plot(metrics["validation"]["AUC"], label="Validation AUC")
+plt.xlabel("Iterations")
+plt.ylabel("AUC")
+plt.title("CatBoost Learning Curve")
+plt.legend()
+plt.show()
+
+# --- Confusion Matrix ---
+cm = confusion_matrix(y_true, preds)
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix")
+plt.show()
+
+# --- Calibration Curve ---
+prob_true, prob_pred = calibration_curve(y_true, pred_probs, n_bins=10)
+plt.plot(prob_pred, prob_true, marker="o")
+plt.plot([0, 1], [0, 1], linestyle="--")
+plt.xlabel("Predicted Probability")
+plt.ylabel("True Probability")
+plt.title("Calibration Curve")
+plt.show()
+
+# --- Per-Project Performance ---
+if "project_name" in XTestSelected.columns:
+    proj_perf = (
+        XTestSelected.assign(pred=preds)
+        .groupby("project_name")[["target", "pred"]]
+        .agg({"target": "mean", "pred": "mean"})
+        .rename(columns={"target": "ActualDupRate", "pred": "PredDupRate"})
+    )
+    proj_perf.plot(kind="bar", figsize=(10, 4))
+    plt.title("Actual vs Predicted Duplicate Rate per Project")
+    plt.ylabel("Duplicate Rate")
+    plt.show()
+
+# --- SHAP Summary Plot ---
+print("\n🔍 Generating SHAP summary plot (may take a minute)...")
+explainer = shap.TreeExplainer(final_model)
+shap_values = explainer.shap_values(XTestSelected[feature_cols])
+shap.summary_plot(shap_values, XTestSelected[feature_cols])
+
+# --- False Positive vs True Positive Distribution Example ---
+if "claim_amount" in XTestSelected.columns:
+    fp = XTestSelected[(preds == 1) & (y_true == 0)]
+    tp = XTestSelected[(preds == 1) & (y_true == 1)]
+    plt.figure(figsize=(6, 3))
+    sns.kdeplot(fp["claim_amount"], label="False Positives", shade=True)
+    sns.kdeplot(tp["claim_amount"], label="True Positives", shade=True)
+    plt.title("Claim Amount Distribution — FP vs TP")
+    plt.legend()
+    plt.show()
+
+# =========================================================
+# 💾 7️⃣ SAVE MODEL & IMPORTANCE
+# =========================================================
+final_model.save_model("catboost_best_model.cbm")
+print("\n✅ Model saved as 'catboost_best_model.cbm'")
+
+feat_imp = final_model.get_feature_importance(prettified=True)
+feat_imp.to_csv("feature_importance.csv", index=False)
+print("📊 Feature importance saved as 'feature_importance.csv'")
