@@ -1,125 +1,143 @@
-from typing import Union
-
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    brier_score_loss,
-    f1_score,
-    log_loss,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-    roc_curve,
+from scipy.stats import entropy
+
+# --------------------------------------------------------
+# 1️⃣ Load and prep your data
+# --------------------------------------------------------
+# Expected columns: ['project_name','date','target','claim_amount', ...]
+# date must be datetime64[ns]
+df = pd.read_csv("claims_data.csv", parse_dates=["date"])
+
+# Optional: ensure project_name is str
+df["project_name"] = df["project_name"].astype(str)
+
+# --------------------------------------------------------
+# 2️⃣ Create basic time features
+# --------------------------------------------------------
+df["month_year"] = df["date"].dt.to_period("M").astype(str)
+df["month_index"] = (df["date"].dt.year - df["date"].dt.year.min()) * 12 + df[
+    "date"
+].dt.month
+
+latest_month_index = df["month_index"].max()
+
+
+# --------------------------------------------------------
+# 3️⃣ Compute Population Stability Index (PSI) per project
+# --------------------------------------------------------
+def psi(expected, actual, bins=10):
+    """Calculate PSI between two numeric distributions."""
+    if expected.nunique() < 2 or actual.nunique() < 2:
+        return 0.0
+    cut = np.linspace(
+        min(expected.min(), actual.min()), max(expected.max(), actual.max()), bins + 1
+    )
+    e_perc = np.histogram(expected, bins=cut)[0] / len(expected)
+    a_perc = np.histogram(actual, bins=cut)[0] / len(actual)
+    e_perc = np.clip(e_perc, 1e-6, None)
+    a_perc = np.clip(a_perc, 1e-6, None)
+    return np.sum((a_perc - e_perc) * np.log(a_perc / e_perc))
+
+
+# Choose baseline vs current window
+baseline = df[df["date"] < "2025-01-01"]
+current = df[df["date"] >= "2025-01-01"]
+
+drift_scores = {}
+for proj in df["project_name"].unique():
+    base = baseline[baseline["project_name"] == proj]
+    curr = current[current["project_name"] == proj]
+    if len(base) > 0 and len(curr) > 0:
+        score = psi(base["claim_amount"], curr["claim_amount"])
+        drift_scores[proj] = score
+    else:
+        drift_scores[proj] = 0.0
+
+drift_df = pd.DataFrame.from_dict(
+    drift_scores, orient="index", columns=["psi"]
+).reset_index()
+drift_df.rename(columns={"index": "project_name"}, inplace=True)
+print("\n=== Drift (PSI) by project ===")
+print(drift_df.sort_values("psi", ascending=False))
+
+# --------------------------------------------------------
+# 4️⃣ Convert drift scores → drift weights
+# --------------------------------------------------------
+max_drift = max(drift_scores.values()) if max(drift_scores.values()) > 0 else 1.0
+drift_df["drift_weight"] = 1.0 + drift_df["psi"] / max_drift  # e.g. 1–2× scale
+df = df.merge(drift_df[["project_name", "drift_weight"]], on="project_name", how="left")
+
+# --------------------------------------------------------
+# 5️⃣ Per-project class weights (handle imbalance inside project)
+# --------------------------------------------------------
+class_stats = (
+    df.groupby("project_name")["target"]
+    .value_counts(normalize=True)
+    .unstack(fill_value=0)
+    .rename(columns={0: "nondup_ratio", 1: "dup_ratio"})
+)
+class_stats["pos_weight"] = class_stats["nondup_ratio"] / (
+    class_stats["dup_ratio"] + 1e-6
+)
+df = df.merge(class_stats[["pos_weight"]], on="project_name", how="left")
+df["class_weight"] = np.where(df["target"] == 1, df["pos_weight"], 1.0)
+
+# --------------------------------------------------------
+# 6️⃣ Time-decay weighting (favor recent data)
+# --------------------------------------------------------
+half_life_months = 6
+lambda_ = np.log(2) / half_life_months
+df["time_weight"] = np.exp(-lambda_ * (latest_month_index - df["month_index"]))
+
+# --------------------------------------------------------
+# 7️⃣ Combine all into one unified final weight
+# --------------------------------------------------------
+df["final_weight"] = df["class_weight"] * df["time_weight"] * df["drift_weight"]
+
+# Optional sanity check
+print("\n=== Average weight per project ===")
+print(df.groupby("project_name")["final_weight"].mean().round(3))
+
+# --------------------------------------------------------
+# 8️⃣ Rolling-window features (within each project)
+# --------------------------------------------------------
+df = df.sort_values(["project_name", "date"])
+df["avg_claim_amt_6m"] = df.groupby("project_name")["claim_amount"].transform(
+    lambda s: s.rolling(window=6, min_periods=1).mean()
+)
+df["dup_rate_3m"] = df.groupby("project_name")["target"].transform(
+    lambda s: s.rolling(window=3, min_periods=1).mean()
 )
 
+# --------------------------------------------------------
+# 9️⃣ Now you can train CatBoost with df['final_weight']
+# --------------------------------------------------------
+from catboost import CatBoostClassifier, Pool
 
-class EvaluateModel:
-    def __init__(
-        self,
-        model,
-        X_train: Union[np.array, pd.DataFrame],
-        X_test: Union[np.array, pd.DataFrame],
-        y_train: pd.Series,
-        y_test: pd.Series,
-        model_name: str,
-        model_type: str,
-    ):
-        self.model = model
-        self.X_train = X_train
-        self.X_test = X_test
-        self.y_train = y_train
-        self.y_test = y_test
-        self.model_name = model_name
-        self.model_type = model_type
+cat_features = ["project_name", "month_year"]
 
-    def predict_outcomes(self, X):
-        if self.model_name == "majority":
-            preds, probs = self._generate_majority_class_preds(y=X)
-        else:
-            preds = self.model.predict(X)
-            probs = self.model.predict_proba(X)
+X = df.drop(columns=["target"])
+y = df["target"]
 
-        return preds, probs
+pool = Pool(X, y, weight=df["final_weight"], cat_features=cat_features)
 
-    def _generate_majority_class_preds(self, y):
-        majority_class = self.y_train.mode()[0]
-        base_array = np.zeros(self.y_train.max() + 1)
-        base_array[majority_class] = 1
+model = CatBoostClassifier(
+    iterations=2000,
+    learning_rate=0.03,
+    depth=8,
+    eval_metric="Precision",
+    random_seed=42,
+    early_stopping_rounds=100,
+)
+model.fit(pool, verbose=200)
+model.save_model("catboost_driftaware_model.cbm")
 
-        preds = pd.Series([majority_class] * y.shape[0])
-        probs = np.tile(base_array, (y.shape[0], 1))
-
-        return preds, probs
-
-    def score_preds(self, y_true, y_pred, y_prob, dataset):
-        mydict = {
-            "model": self.model_name,
-            "model_type": self.model_type,
-            "dataset": dataset,
-            "accuracy": accuracy_score(y_true, y_pred),
-            "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-            "precision": precision_score(y_true, y_pred),
-            "recall": recall_score(y_true, y_pred),
-            "f1": f1_score(y_true, y_pred),
-            "log_loss": log_loss(y_true, y_prob),
-            "brier": brier_score_loss(y_true, y_prob[:, 1]),
-            "roc_auc": roc_auc_score(y_true, y_prob[:, 1]),
-        }
-
-        return mydict
-
-    def plot_roc_curve(self, y_true, y_prob, dataset):
-        fig, ax = plt.subplots(1, 2, figsize=(16, 6))
-
-        ns_probs = [0 for _ in range(len(y_true))]
-        lr_probs = y_prob[:, 1]
-        ns_auc = roc_auc_score(y_true, ns_probs)
-        lr_auc = roc_auc_score(y_true, lr_probs)
-
-        # summarize scores
-        print("No Skill: ROC AUC=%.3f" % (ns_auc))
-        print(f"{self.model_name}: ROC AUC=%.3f" % (lr_auc))
-        # calculate roc curves
-        ns_fpr, ns_tpr, _ = roc_curve(y_true, ns_probs)
-        lr_fpr, lr_tpr, _ = roc_curve(y_true, lr_probs)
-
-        # plot the roc curve for the model
-        ax[0].plot(ns_fpr, ns_tpr, linestyle="--", label="No Skill")
-        ax[0].plot(lr_fpr, lr_tpr, marker=".", label=f"{self.model_name}")
-        ax[0].set_xlabel("False Positive Rate")
-        ax[0].set_ylabel("True Positive Rate")
-        ax[0].set_title("ROC Curve")
-        ax[0].legend()
-
-        # Additional subplot (you can modify this part as needed)
-        ax[1].hist(lr_probs, bins=50, label=f"{self.model_name} Probabilities")
-        ax[1].set_xlim(0, 1)
-        ax[1].set_xlabel("Probability")
-        ax[1].set_ylabel("Frequency")
-        ax[1].set_title(f"Distribution of Probabilities")
-        ax[1].legend()
-
-        plt.suptitle(
-            f"{self.model_type.title()} {self.model_name.title()} Model for {dataset.title()}".strip(),
-            fontsize=16,
-        )
-
-        plt.tight_layout()  # Ensures proper spacing between subplots
-        plt.show()
-
-    def run(self):
-        y_pred_train, y_prob_train = self.predict_outcomes(self.X_train)
-        y_pred, y_prob = self.predict_outcomes(self.X_test)
-        train_scores = self.score_preds(
-            self.y_train, y_pred_train, y_prob_train, "train"
-        )
-        test_scores = self.score_preds(self.y_test, y_pred, y_prob, "test")
-        scores = pd.DataFrame([train_scores, test_scores])
-
-        self.plot_roc_curve(self.y_train, y_prob_train, "training")
-        self.plot_roc_curve(self.y_test, y_prob, "testing")
-
-        return scores, (y_prob_train, y_prob)
+# --------------------------------------------------------
+# 10️⃣ Optional: inspect top feature importances
+# --------------------------------------------------------
+fi = pd.DataFrame(
+    {"feature": model.feature_names_, "importance": model.get_feature_importance()}
+)
+print("\n=== Top features ===")
+print(fi.sort_values("importance", ascending=False).head(10))
