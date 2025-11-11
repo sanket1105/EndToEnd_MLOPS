@@ -589,3 +589,287 @@ When drift is detected, it means:
 - Feature relationships may have changed
     """
     )
+
+##=============================================================
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from scipy import stats
+
+
+def drift_deep_dive(df, month_col, feature, month1, month2, top_n=15):
+    """
+    Deep dive into WHY a specific feature is drifting.
+    Shows which categories are changing and by how much.
+
+    Parameters:
+    -----------
+    df : DataFrame with your data
+    month_col : name of your month column
+    feature : the drifting feature you want to investigate
+    month1, month2 : two months to compare
+    top_n : number of categories to show
+    """
+
+    # Get data for both months
+    df1 = df[df[month_col] == month1]
+    df2 = df[df[month_col] == month2]
+
+    # Calculate distributions
+    dist1 = df1[feature].value_counts(normalize=True)
+    dist2 = df2[feature].value_counts(normalize=True)
+
+    # Combine and analyze
+    dist_df = pd.concat([dist1, dist2], axis=1, keys=[month1, month2]).fillna(0)
+    dist_df["change"] = dist_df[month2] - dist_df[month1]
+    dist_df["pct_change"] = (
+        (dist_df[month2] - dist_df[month1]) / (dist_df[month1] + 1e-10)
+    ) * 100
+    dist_df["abs_change"] = dist_df["change"].abs()
+
+    # Classify drift types
+    dist_df["drift_type"] = "Stable"
+    dist_df.loc[dist_df["change"] > 0.02, "drift_type"] = "Increasing"
+    dist_df.loc[dist_df["change"] < -0.02, "drift_type"] = "Decreasing"
+    dist_df.loc[(dist_df[month1] == 0) & (dist_df[month2] > 0), "drift_type"] = "NEW"
+    dist_df.loc[(dist_df[month1] > 0) & (dist_df[month2] == 0), "drift_type"] = (
+        "DISAPPEARED"
+    )
+
+    dist_df = dist_df.sort_values("abs_change", ascending=False)
+
+    # Print Analysis
+    print("=" * 80)
+    print(f"WHY IS '{feature}' DRIFTING?")
+    print(f"{month1} (n={len(df1):,}) → {month2} (n={len(df2):,})")
+    print("=" * 80)
+
+    # Overall metrics
+    tvd = 0.5 * dist_df["abs_change"].sum()
+    print(f"\nTotal Variation Distance: {tvd:.4f}")
+    if tvd > 0.2:
+        print("  → SEVERE drift (distribution fundamentally changed)")
+    elif tvd > 0.1:
+        print("  → MODERATE drift (noticeable shift)")
+    else:
+        print("  → MILD drift (minor changes)")
+
+    # What changed?
+    new_cats = dist_df[dist_df["drift_type"] == "NEW"]
+    disappeared = dist_df[dist_df["drift_type"] == "DISAPPEARED"]
+    increasing = dist_df[dist_df["drift_type"] == "Increasing"]
+    decreasing = dist_df[dist_df["drift_type"] == "Decreasing"]
+
+    print(f"\n📊 BREAKDOWN:")
+    print(f"   {len(new_cats):3d} NEW categories appeared")
+    print(f"   {len(disappeared):3d} categories DISAPPEARED")
+    print(f"   {len(increasing):3d} categories INCREASING")
+    print(f"   {len(decreasing):3d} categories DECREASING")
+
+    # Top changers
+    print(f"\n🔥 TOP {min(10, len(dist_df))} BIGGEST CHANGES:")
+    print("-" * 80)
+    for i, (cat, row) in enumerate(dist_df.head(10).iterrows(), 1):
+        m1_pct = row[month1] * 100
+        m2_pct = row[month2] * 100
+        change = row["change"] * 100
+        dtype = row["drift_type"]
+
+        arrow = "📈" if change > 0 else "📉" if change < 0 else "➡️"
+        print(f"{i:2d}. {cat[:40]:40s} {arrow} {dtype:12s}")
+        print(
+            f"    {month1}: {m1_pct:6.2f}%  →  {month2}: {m2_pct:6.2f}%  (change: {change:+.2f}%)"
+        )
+
+    # Category details by type
+    if len(new_cats) > 0:
+        print(f"\n✨ NEW CATEGORIES (why they appeared):")
+        for cat in new_cats.head(5).index:
+            pct = new_cats.loc[cat, month2] * 100
+            print(f"   • {cat}: {pct:.2f}% of {month2} data")
+
+    if len(disappeared) > 0:
+        print(f"\n❌ DISAPPEARED CATEGORIES (why they're gone):")
+        for cat in disappeared.head(5).index:
+            pct = disappeared.loc[cat, month1] * 100
+            print(f"   • {cat}: was {pct:.2f}% in {month1}")
+
+    if len(increasing) > 0:
+        print(f"\n📈 GROWING CATEGORIES (gaining share):")
+        for cat in increasing.head(5).index:
+            m1 = increasing.loc[cat, month1] * 100
+            m2 = increasing.loc[cat, month2] * 100
+            print(f"   • {cat}: {m1:.2f}% → {m2:.2f}% (+{m2-m1:.2f}%)")
+
+    if len(decreasing) > 0:
+        print(f"\n📉 SHRINKING CATEGORIES (losing share):")
+        for cat in decreasing.head(5).index:
+            m1 = decreasing.loc[cat, month1] * 100
+            m2 = decreasing.loc[cat, month2] * 100
+            print(f"   • {cat}: {m1:.2f}% → {m2:.2f}% ({m2-m1:.2f}%)")
+
+    # Create visualizations
+    fig = plt.figure(figsize=(18, 10))
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+
+    # 1. Before/After comparison
+    ax1 = fig.add_subplot(gs[0, :2])
+    top_cats = dist_df.head(top_n).index
+    x = np.arange(len(top_cats))
+    width = 0.35
+
+    ax1.bar(
+        x - width / 2,
+        dist_df.loc[top_cats, month1] * 100,
+        width,
+        label=month1,
+        alpha=0.8,
+        color="#3b82f6",
+    )
+    ax1.bar(
+        x + width / 2,
+        dist_df.loc[top_cats, month2] * 100,
+        width,
+        label=month2,
+        alpha=0.8,
+        color="#ef4444",
+    )
+    ax1.set_ylabel("Percentage (%)", fontsize=12, fontweight="bold")
+    ax1.set_title(f"{feature}: Before vs After", fontsize=14, fontweight="bold")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(top_cats, rotation=45, ha="right", fontsize=9)
+    ax1.legend(fontsize=11)
+    ax1.grid(axis="y", alpha=0.3)
+
+    # 2. Change magnitude
+    ax2 = fig.add_subplot(gs[0, 2])
+    changes = dist_df.head(10)["change"] * 100
+    colors = ["#10b981" if x > 0 else "#ef4444" for x in changes]
+    ax2.barh(range(len(changes)), changes, color=colors, alpha=0.8)
+    ax2.set_yticks(range(len(changes)))
+    ax2.set_yticklabels(changes.index, fontsize=9)
+    ax2.axvline(0, color="black", linewidth=1.5)
+    ax2.set_xlabel("Change (%)", fontsize=11, fontweight="bold")
+    ax2.set_title("Absolute Change", fontsize=12, fontweight="bold")
+    ax2.grid(axis="x", alpha=0.3)
+
+    # 3. Drift type breakdown
+    ax3 = fig.add_subplot(gs[1, 0])
+    drift_counts = dist_df["drift_type"].value_counts()
+    colors_pie = {
+        "Increasing": "#10b981",
+        "Decreasing": "#ef4444",
+        "Stable": "#94a3b8",
+        "NEW": "#8b5cf6",
+        "DISAPPEARED": "#f59e0b",
+    }
+    pie_colors = [colors_pie.get(x, "#94a3b8") for x in drift_counts.index]
+    wedges, texts, autotexts = ax3.pie(
+        drift_counts.values,
+        labels=drift_counts.index,
+        autopct="%1.1f%%",
+        colors=pie_colors,
+        startangle=90,
+    )
+    for autotext in autotexts:
+        autotext.set_color("white")
+        autotext.set_fontweight("bold")
+    ax3.set_title("Drift Type Breakdown", fontsize=12, fontweight="bold")
+
+    # 4. Relative change (%)
+    ax4 = fig.add_subplot(gs[1, 1])
+    pct_changes = dist_df.head(10)["pct_change"].replace([np.inf, -np.inf], 0)
+    colors_pct = ["#10b981" if x > 0 else "#ef4444" for x in pct_changes]
+    ax4.barh(range(len(pct_changes)), pct_changes, color=colors_pct, alpha=0.8)
+    ax4.set_yticks(range(len(pct_changes)))
+    ax4.set_yticklabels(pct_changes.index, fontsize=9)
+    ax4.axvline(0, color="black", linewidth=1.5)
+    ax4.set_xlabel("Relative Change (%)", fontsize=11, fontweight="bold")
+    ax4.set_title("% Change from Baseline", fontsize=12, fontweight="bold")
+    ax4.grid(axis="x", alpha=0.3)
+
+    # 5. Cumulative distribution
+    ax5 = fig.add_subplot(gs[1, 2])
+    sorted1 = dist1.sort_values(ascending=False).cumsum() * 100
+    sorted2 = dist2.sort_values(ascending=False).cumsum() * 100
+
+    ax5.plot(
+        range(len(sorted1[:30])),
+        sorted1[:30].values,
+        label=month1,
+        linewidth=2.5,
+        marker="o",
+        markersize=5,
+        color="#3b82f6",
+    )
+    ax5.plot(
+        range(len(sorted2[:30])),
+        sorted2[:30].values,
+        label=month2,
+        linewidth=2.5,
+        marker="s",
+        markersize=5,
+        color="#ef4444",
+    )
+    ax5.axhline(80, color="gray", linestyle="--", alpha=0.5, linewidth=1.5)
+    ax5.set_xlabel("Category Rank", fontsize=11, fontweight="bold")
+    ax5.set_ylabel("Cumulative %", fontsize=11, fontweight="bold")
+    ax5.set_title("Cumulative Distribution", fontsize=12, fontweight="bold")
+    ax5.legend(fontsize=10)
+    ax5.grid(alpha=0.3)
+
+    plt.suptitle(
+        f"Drift Deep Dive: {feature}\nWhy it's changing from {month1} to {month2}",
+        fontsize=16,
+        fontweight="bold",
+    )
+
+    plt.savefig(f"drift_deepdive_{feature}.png", dpi=300, bbox_inches="tight")
+    print(f"\n📊 Saved: drift_deepdive_{feature}.png")
+    plt.show()
+
+    # Root cause summary
+    print("\n" + "=" * 80)
+    print("🔍 ROOT CAUSE SUMMARY")
+    print("=" * 80)
+
+    if len(new_cats) > 3:
+        print(
+            f"⚠️  Many new categories ({len(new_cats)}) → Possible data source change or expansion"
+        )
+    if len(disappeared) > 3:
+        print(
+            f"⚠️  Many disappeared categories ({len(disappeared)}) → Possible discontinuation or data quality issue"
+        )
+
+    # Check concentration
+    herfindahl1 = (dist1**2).sum()
+    herfindahl2 = (dist2**2).sum()
+    if herfindahl2 > herfindahl1 * 1.15:
+        print(f"⚠️  Distribution MORE concentrated → Few categories dominating")
+    elif herfindahl2 < herfindahl1 * 0.85:
+        print(f"⚠️  Distribution LESS concentrated → More diversity/fragmentation")
+
+    # Check if systematic shift
+    if len(increasing) > len(decreasing) * 1.5:
+        print(
+            f"⚠️  More categories growing than shrinking → Possible expansion/growth pattern"
+        )
+    elif len(decreasing) > len(increasing) * 1.5:
+        print(
+            f"⚠️  More categories shrinking than growing → Possible contraction/consolidation"
+        )
+
+    print("\n💡 RECOMMENDATION:")
+    if tvd > 0.15:
+        print("   🚨 CRITICAL: Immediate model retraining needed")
+        print("   🔎 Investigate business/operational changes in data collection")
+    elif tvd > 0.08:
+        print("   ⚠️  Schedule model retraining soon")
+        print("   📊 Monitor this feature closely in upcoming periods")
+    else:
+        print("   ✓ Continue monitoring, retraining not urgent")
+
+    return dist_df
