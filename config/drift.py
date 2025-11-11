@@ -1,0 +1,591 @@
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from scipy import stats
+from scipy.spatial.distance import jensenshannon
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import LabelEncoder
+
+warnings.filterwarnings("ignore")
+
+
+class DataDriftAnalyzer:
+    """
+    Comprehensive drift detection for categorical features across time periods.
+    Detects distribution changes using multiple statistical tests and visualizations.
+    """
+
+    def __init__(self, df, month_col):
+        """
+        Initialize the analyzer.
+
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            Input dataframe with time series data
+        month_col : str
+            Column name containing month/date information
+        """
+        self.df = df.copy()
+        self.month_col = month_col
+        self.months = sorted(df[month_col].unique())
+        self.features = [col for col in df.columns if col != month_col]
+        self.results = {}
+
+    def calculate_entropy(self, distribution):
+        """Calculate Shannon entropy for a distribution."""
+        probs = distribution / distribution.sum()
+        probs = probs[probs > 0]
+        return -np.sum(probs * np.log2(probs))
+
+    def calculate_psi(self, expected, actual, buckets=10):
+        """
+        Calculate Population Stability Index (PSI).
+
+        PSI < 0.1: No significant change
+        0.1 <= PSI < 0.2: Moderate change
+        PSI >= 0.2: Significant change
+        """
+        if expected.dtype == "object" or actual.dtype == "object":
+            expected_counts = expected.value_counts(normalize=True, sort=False)
+            actual_counts = actual.value_counts(normalize=True, sort=False)
+
+            all_categories = set(expected_counts.index) | set(actual_counts.index)
+            expected_pct = pd.Series(
+                {cat: expected_counts.get(cat, 0.0001) for cat in all_categories}
+            )
+            actual_pct = pd.Series(
+                {cat: actual_counts.get(cat, 0.0001) for cat in all_categories}
+            )
+        else:
+            breakpoints = np.linspace(
+                min(expected.min(), actual.min()),
+                max(expected.max(), actual.max()),
+                buckets + 1,
+            )
+            expected_pct = pd.cut(
+                expected, bins=breakpoints, include_lowest=True
+            ).value_counts(normalize=True, sort=False)
+            actual_pct = pd.cut(
+                actual, bins=breakpoints, include_lowest=True
+            ).value_counts(normalize=True, sort=False)
+            expected_pct = expected_pct.fillna(0.0001)
+            actual_pct = actual_pct.fillna(0.0001)
+
+        psi = np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct))
+        return psi
+
+    def chi_square_test(self, month1, month2, feature):
+        """Perform chi-square test for categorical variables."""
+        data1 = self.df[self.df[self.month_col] == month1][feature]
+        data2 = self.df[self.df[self.month_col] == month2][feature]
+
+        all_categories = set(data1.unique()) | set(data2.unique())
+        counts1 = data1.value_counts()
+        counts2 = data2.value_counts()
+
+        observed = []
+        for cat in all_categories:
+            observed.append([counts1.get(cat, 0), counts2.get(cat, 0)])
+
+        observed = np.array(observed)
+
+        try:
+            chi2, p_value, dof, expected = stats.chi2_contingency(observed.T)
+            return chi2, p_value
+        except:
+            return 0, 1.0
+
+    def calculate_js_divergence(self, month1, month2, feature):
+        """Calculate Jensen-Shannon divergence between two distributions."""
+        data1 = self.df[self.df[self.month_col] == month1][feature]
+        data2 = self.df[self.df[self.month_col] == month2][feature]
+
+        all_categories = sorted(set(data1.unique()) | set(data2.unique()))
+
+        counts1 = data1.value_counts(normalize=True)
+        counts2 = data2.value_counts(normalize=True)
+
+        p = np.array([counts1.get(cat, 1e-10) for cat in all_categories])
+        q = np.array([counts2.get(cat, 1e-10) for cat in all_categories])
+
+        p = p / p.sum()
+        q = q / q.sum()
+
+        return jensenshannon(p, q) ** 2
+
+    def model_based_drift_detection(self, month1, month2, feature):
+        """
+        Train a classifier to distinguish between two time periods.
+        Higher AUC indicates stronger drift.
+
+        AUC ~ 0.5: No drift
+        AUC > 0.6: Mild drift
+        AUC > 0.75: Strong drift
+        """
+        data1 = self.df[self.df[self.month_col] == month1][[feature]].copy()
+        data2 = self.df[self.df[self.month_col] == month2][[feature]].copy()
+
+        data1["target"] = 0
+        data2["target"] = 1
+
+        combined = pd.concat([data1, data2], ignore_index=True)
+
+        le = LabelEncoder()
+        combined[feature + "_encoded"] = le.fit_transform(combined[feature].astype(str))
+
+        X = combined[[feature + "_encoded"]].values
+        y = combined["target"].values
+
+        try:
+            model = LogisticRegression(random_state=42, max_iter=1000)
+            model.fit(X, y)
+            y_pred = model.predict_proba(X)[:, 1]
+            auc = roc_auc_score(y, y_pred)
+            return auc
+        except:
+            return 0.5
+
+    def analyze_feature(self, feature):
+        """Perform comprehensive drift analysis for a single feature."""
+        print(f"\n{'='*60}")
+        print(f"Analyzing feature: {feature}")
+        print(f"{'='*60}")
+
+        results = {
+            "feature": feature,
+            "monthly_distributions": {},
+            "monthly_entropy": {},
+            "drift_metrics": [],
+            "top_categories": None,
+        }
+
+        for month in self.months:
+            data = self.df[self.df[self.month_col] == month][feature]
+            dist = data.value_counts()
+            results["monthly_distributions"][month] = dist
+            results["monthly_entropy"][month] = self.calculate_entropy(dist)
+
+        all_values = self.df[feature].value_counts()
+        results["top_categories"] = all_values.head(5).index.tolist()
+
+        for i in range(len(self.months) - 1):
+            month1, month2 = self.months[i], self.months[i + 1]
+
+            data1 = self.df[self.df[self.month_col] == month1][feature]
+            data2 = self.df[self.df[self.month_col] == month2][feature]
+
+            chi2, p_value = self.chi_square_test(month1, month2, feature)
+            psi = self.calculate_psi(data1, data2)
+            jsd = self.calculate_js_divergence(month1, month2, feature)
+            auc = self.model_based_drift_detection(month1, month2, feature)
+
+            drift_detected = psi > 0.1 or jsd > 0.1 or auc > 0.6
+
+            metrics = {
+                "comparison": f"{month1} -> {month2}",
+                "chi_square": chi2,
+                "p_value": p_value,
+                "psi": psi,
+                "js_divergence": jsd,
+                "model_auc": auc,
+                "drift_detected": drift_detected,
+            }
+
+            results["drift_metrics"].append(metrics)
+
+            print(f"\n{month1} -> {month2}:")
+            print(f"  Chi-square: {chi2:.2f} (p={p_value:.4f})")
+            print(f"  PSI: {psi:.4f} {'DRIFT DETECTED' if psi > 0.1 else 'Stable'}")
+            print(
+                f"  JS Divergence: {jsd:.4f} {'DRIFT DETECTED' if jsd > 0.1 else 'Stable'}"
+            )
+            print(
+                f"  Model AUC: {auc:.4f} {'DRIFT DETECTED' if auc > 0.6 else 'Stable'}"
+            )
+            print(
+                f"  Overall: {'DRIFT DETECTED' if drift_detected else 'No significant drift'}"
+            )
+
+        return results
+
+    def analyze_all_features(self):
+        """Analyze drift for all features."""
+        print("\n" + "=" * 60)
+        print("COMPREHENSIVE DATA DRIFT ANALYSIS")
+        print("=" * 60)
+        print(f"Dataset: {len(self.df)} rows, {len(self.features)} features")
+        print(f"Time periods: {len(self.months)} months")
+        print(f"Months: {', '.join(map(str, self.months))}")
+
+        for feature in self.features:
+            self.results[feature] = self.analyze_feature(feature)
+
+        self._generate_summary()
+
+    def _generate_summary(self):
+        """Generate overall drift summary."""
+        print("\n" + "=" * 60)
+        print("DRIFT SUMMARY")
+        print("=" * 60)
+
+        summary = []
+        for feature, result in self.results.items():
+            metrics = result["drift_metrics"]
+            avg_psi = np.mean([m["psi"] for m in metrics])
+            max_psi = np.max([m["psi"] for m in metrics])
+            avg_jsd = np.mean([m["js_divergence"] for m in metrics])
+            avg_auc = np.mean([m["model_auc"] for m in metrics])
+            drift_rate = sum([m["drift_detected"] for m in metrics]) / len(metrics)
+
+            summary.append(
+                {
+                    "Feature": feature,
+                    "Avg PSI": avg_psi,
+                    "Max PSI": max_psi,
+                    "Avg JSD": avg_jsd,
+                    "Avg AUC": avg_auc,
+                    "Drift Rate": drift_rate,
+                    "Status": (
+                        "HIGH DRIFT"
+                        if avg_psi > 0.2
+                        else ("MODERATE" if avg_psi > 0.1 else "STABLE")
+                    ),
+                }
+            )
+
+        summary_df = pd.DataFrame(summary).sort_values("Avg PSI", ascending=False)
+        print("\n", summary_df.to_string(index=False))
+
+        high_drift_features = summary_df[summary_df["Avg PSI"] > 0.2][
+            "Feature"
+        ].tolist()
+        moderate_drift_features = summary_df[
+            (summary_df["Avg PSI"] > 0.1) & (summary_df["Avg PSI"] <= 0.2)
+        ]["Feature"].tolist()
+
+        print("\n" + "=" * 60)
+        print("CONCLUSION")
+        print("=" * 60)
+
+        if high_drift_features:
+            print(f"\nHIGH DRIFT detected in {len(high_drift_features)} feature(s):")
+            for f in high_drift_features:
+                print(f"   - {f}")
+            print(
+                "\n   These features show significant distribution changes over time."
+            )
+            print(
+                "   The new data is NOT from the same distribution as earlier periods."
+            )
+
+        if moderate_drift_features:
+            print(
+                f"\nMODERATE DRIFT detected in {len(moderate_drift_features)} feature(s):"
+            )
+            for f in moderate_drift_features:
+                print(f"   - {f}")
+            print("\n   These features show noticeable distribution shifts.")
+
+        stable_features = (
+            len(summary_df) - len(high_drift_features) - len(moderate_drift_features)
+        )
+        if stable_features > 0:
+            print(f"\n{stable_features} feature(s) remain stable.")
+
+        print("\n" + "=" * 60)
+        print("RECOMMENDATIONS")
+        print("=" * 60)
+        print("1. Model retraining recommended for high-drift features")
+        print("2. Implement continuous monitoring for moderate-drift features")
+        print("3. Investigate root causes of distribution shifts")
+        print("4. Consider adaptive sampling or feature engineering")
+        print("5. Update training data to include recent distributions")
+
+        return summary_df
+
+    def plot_drift_summary(self, figsize=(14, 10)):
+        """Create comprehensive visualization of drift analysis."""
+        if not self.results:
+            print("Run analyze_all_features() first!")
+            return
+
+        summary = []
+        for feature, result in self.results.items():
+            metrics = result["drift_metrics"]
+            avg_psi = np.mean([m["psi"] for m in metrics])
+            summary.append({"Feature": feature, "Avg PSI": avg_psi})
+        summary_df = pd.DataFrame(summary).sort_values("Avg PSI", ascending=False)
+
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+
+        ax1 = fig.add_subplot(gs[0, :])
+        colors = [
+            "#ef4444" if x > 0.2 else "#f59e0b" if x > 0.1 else "#10b981"
+            for x in summary_df["Avg PSI"]
+        ]
+        ax1.barh(summary_df["Feature"], summary_df["Avg PSI"], color=colors)
+        ax1.axvline(
+            0.1, color="orange", linestyle="--", alpha=0.7, label="Moderate threshold"
+        )
+        ax1.axvline(0.2, color="red", linestyle="--", alpha=0.7, label="High threshold")
+        ax1.set_xlabel("Average PSI", fontsize=12, fontweight="bold")
+        ax1.set_title(
+            "Population Stability Index (PSI) by Feature",
+            fontsize=14,
+            fontweight="bold",
+        )
+        ax1.legend()
+        ax1.grid(axis="x", alpha=0.3)
+
+        top_feature = summary_df.iloc[0]["Feature"]
+        entropy_data = self.results[top_feature]["monthly_entropy"]
+        ax2 = fig.add_subplot(gs[1, 0])
+        months_list = list(entropy_data.keys())
+        entropy_values = list(entropy_data.values())
+        ax2.plot(
+            months_list,
+            entropy_values,
+            marker="o",
+            linewidth=2,
+            markersize=8,
+            color="#3b82f6",
+        )
+        ax2.set_xlabel("Month", fontsize=11, fontweight="bold")
+        ax2.set_ylabel("Entropy", fontsize=11, fontweight="bold")
+        ax2.set_title(
+            f"Entropy Evolution: {top_feature}", fontsize=12, fontweight="bold"
+        )
+        ax2.grid(alpha=0.3)
+        ax2.tick_params(axis="x", rotation=45)
+
+        ax3 = fig.add_subplot(gs[1, 1])
+        top_cats = self.results[top_feature]["top_categories"][:3]
+        for cat in top_cats:
+            percentages = []
+            for month in self.months:
+                dist = self.results[top_feature]["monthly_distributions"][month]
+                pct = (dist.get(cat, 0) / dist.sum()) * 100
+                percentages.append(pct)
+            ax3.plot(self.months, percentages, marker="o", label=str(cat), linewidth=2)
+        ax3.set_xlabel("Month", fontsize=11, fontweight="bold")
+        ax3.set_ylabel("Percentage (%)", fontsize=11, fontweight="bold")
+        ax3.set_title(
+            f"Top Categories Trend: {top_feature}", fontsize=12, fontweight="bold"
+        )
+        ax3.legend()
+        ax3.grid(alpha=0.3)
+        ax3.tick_params(axis="x", rotation=45)
+
+        ax4 = fig.add_subplot(gs[2, :])
+        auc_data = []
+        features_list = []
+        for feature, result in self.results.items():
+            aucs = [m["model_auc"] for m in result["drift_metrics"]]
+            auc_data.append(aucs)
+            features_list.append(feature)
+
+        comparisons = [
+            m["comparison"] for m in self.results[top_feature]["drift_metrics"]
+        ]
+        auc_df = pd.DataFrame(auc_data, columns=comparisons, index=features_list)
+
+        sns.heatmap(
+            auc_df,
+            annot=True,
+            fmt=".3f",
+            cmap="RdYlGn_r",
+            center=0.6,
+            ax=ax4,
+            cbar_kws={"label": "AUC Score"},
+            vmin=0.5,
+            vmax=0.9,
+        )
+        ax4.set_title(
+            "Model-Based Drift Detection (AUC per Month Pair)",
+            fontsize=12,
+            fontweight="bold",
+        )
+        ax4.set_xlabel("Month Comparison", fontsize=11, fontweight="bold")
+        ax4.set_ylabel("Feature", fontsize=11, fontweight="bold")
+
+        plt.suptitle(
+            "Comprehensive Data Drift Analysis Dashboard",
+            fontsize=16,
+            fontweight="bold",
+            y=0.995,
+        )
+
+        plt.tight_layout()
+        plt.savefig("drift_analysis_dashboard.png", dpi=300, bbox_inches="tight")
+        print("\nDashboard saved as 'drift_analysis_dashboard.png'")
+        plt.show()
+
+    def plot_feature_details(self, feature, figsize=(14, 8)):
+        """Create detailed visualization for a specific feature."""
+        if feature not in self.results:
+            print(f"Feature '{feature}' not found. Run analyze_all_features() first!")
+            return
+
+        result = self.results[feature]
+
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        fig.suptitle(
+            f"Detailed Drift Analysis: {feature}", fontsize=16, fontweight="bold"
+        )
+
+        entropy_data = result["monthly_entropy"]
+        axes[0, 0].plot(
+            list(entropy_data.keys()),
+            list(entropy_data.values()),
+            marker="o",
+            linewidth=2,
+            markersize=8,
+            color="#3b82f6",
+        )
+        axes[0, 0].set_title("Entropy Evolution", fontweight="bold")
+        axes[0, 0].set_xlabel("Month", fontweight="bold")
+        axes[0, 0].set_ylabel("Entropy", fontweight="bold")
+        axes[0, 0].grid(alpha=0.3)
+        axes[0, 0].tick_params(axis="x", rotation=45)
+
+        metrics = result["drift_metrics"]
+        comparisons = [m["comparison"] for m in metrics]
+        psi_values = [m["psi"] for m in metrics]
+        colors = [
+            "#ef4444" if x > 0.2 else "#f59e0b" if x > 0.1 else "#10b981"
+            for x in psi_values
+        ]
+        axes[0, 1].bar(range(len(comparisons)), psi_values, color=colors)
+        axes[0, 1].axhline(0.1, color="orange", linestyle="--", alpha=0.7)
+        axes[0, 1].axhline(0.2, color="red", linestyle="--", alpha=0.7)
+        axes[0, 1].set_title("PSI Values (Month-to-Month)", fontweight="bold")
+        axes[0, 1].set_xlabel("Comparison", fontweight="bold")
+        axes[0, 1].set_ylabel("PSI", fontweight="bold")
+        axes[0, 1].set_xticks(range(len(comparisons)))
+        axes[0, 1].set_xticklabels(comparisons, rotation=45, ha="right")
+        axes[0, 1].grid(axis="y", alpha=0.3)
+
+        top_cats = result["top_categories"][:5]
+        for cat in top_cats:
+            percentages = []
+            for month in self.months:
+                dist = result["monthly_distributions"][month]
+                pct = (dist.get(cat, 0) / dist.sum()) * 100
+                percentages.append(pct)
+            axes[1, 0].plot(
+                self.months, percentages, marker="o", label=str(cat), linewidth=2
+            )
+        axes[1, 0].set_title("Top 5 Categories Frequency", fontweight="bold")
+        axes[1, 0].set_xlabel("Month", fontweight="bold")
+        axes[1, 0].set_ylabel("Percentage (%)", fontweight="bold")
+        axes[1, 0].legend(fontsize=8)
+        axes[1, 0].grid(alpha=0.3)
+        axes[1, 0].tick_params(axis="x", rotation=45)
+
+        jsd_values = [m["js_divergence"] for m in metrics]
+        auc_values = [m["model_auc"] for m in metrics]
+
+        x = np.arange(len(comparisons))
+        width = 0.35
+
+        axes[1, 1].bar(
+            x - width / 2, jsd_values, width, label="JS Divergence", color="#8b5cf6"
+        )
+        axes[1, 1].bar(
+            x + width / 2,
+            [a - 0.5 for a in auc_values],
+            width,
+            label="AUC - 0.5",
+            color="#ec4899",
+        )
+        axes[1, 1].set_title("Drift Metrics Comparison", fontweight="bold")
+        axes[1, 1].set_xlabel("Comparison", fontweight="bold")
+        axes[1, 1].set_ylabel("Value", fontweight="bold")
+        axes[1, 1].set_xticks(x)
+        axes[1, 1].set_xticklabels(comparisons, rotation=45, ha="right")
+        axes[1, 1].legend()
+        axes[1, 1].grid(axis="y", alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(f"drift_analysis_{feature}.png", dpi=300, bbox_inches="tight")
+        print(f"\nFeature analysis saved as 'drift_analysis_{feature}.png'")
+        plt.show()
+
+
+# Example usage
+if __name__ == "__main__":
+    np.random.seed(42)
+
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
+    data = []
+
+    for i, month in enumerate(months):
+        n_samples = 1000
+
+        cat_a_probs = [0.4, 0.35, 0.30, 0.25, 0.20, 0.15]
+        categories_a = np.random.choice(
+            ["X", "Y", "Z"],
+            n_samples,
+            p=[cat_a_probs[i], 0.3, 1 - cat_a_probs[i] - 0.3],
+        )
+
+        if i < 2:
+            categories_b = np.random.choice(
+                ["A", "B", "C"], n_samples, p=[0.6, 0.3, 0.1]
+            )
+        else:
+            categories_b = np.random.choice(
+                ["A", "B", "C"], n_samples, p=[0.2, 0.5, 0.3]
+            )
+
+        categories_c = np.random.choice(["P", "Q", "R"], n_samples, p=[0.5, 0.3, 0.2])
+
+        for j in range(n_samples):
+            data.append(
+                {
+                    "month": month,
+                    "feature_gradual_drift": categories_a[j],
+                    "feature_sudden_drift": categories_b[j],
+                    "feature_stable": categories_c[j],
+                }
+            )
+
+    df = pd.DataFrame(data)
+
+    print("\nSample Dataset Created:")
+    print(df.head(10))
+    print(f"\nShape: {df.shape}")
+
+    analyzer = DataDriftAnalyzer(df, month_col="month")
+    analyzer.analyze_all_features()
+
+    analyzer.plot_drift_summary()
+
+    analyzer.plot_feature_details("feature_gradual_drift")
+
+    print("\nAnalysis complete!")
+    print("\n" + "=" * 60)
+    print("INTERPRETATION:")
+    print("=" * 60)
+    print(
+        """
+This analysis proves data drift exists when:
+1. PSI > 0.1 indicates distribution changes
+2. Category frequencies shift significantly over time
+3. Entropy increases (more randomness/diversity)
+4. New categories appear or existing ones disappear
+5. A simple model can distinguish between time periods (AUC > 0.6)
+
+When drift is detected, it means:
+- New data is NOT from the same distribution
+- Model performance may degrade
+- Retraining or monitoring is required
+- Feature relationships may have changed
+    """
+    )
