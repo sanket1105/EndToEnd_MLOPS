@@ -11,6 +11,11 @@ from scipy.spatial.distance import jensenshannon
 
 warnings.filterwarnings("ignore")
 
+from datetime import datetime
+
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
 
 class MultiMonthDriftAnalysis:
     """
@@ -554,6 +559,61 @@ ASSESSMENT:
         )
 
         return fig
+
+
+def generate_pdf_report(analyzer, filename=None):
+    """
+    Generate a complete multi-month drift PDF report for the given analyzer.
+
+    Parameters
+    ----------
+    analyzer : MultiMonthDriftAnalysis
+        An instance of the MultiMonthDriftAnalysis class after running analysis.
+    filename : str, optional
+        Output filename for the PDF. If not provided, it will include a timestamp.
+
+    Returns
+    -------
+    str
+        Path to the generated PDF file.
+    """
+    if filename is None:
+        filename = f"multi_month_drift_report_{datetime.now():%Y%m%d_%H%M}.pdf"
+
+    print(f"\n📄 Generating comprehensive drift report: {filename}")
+
+    with PdfPages(filename) as pdf:
+        # Executive summary
+        try:
+            fig_summary = analyzer.create_executive_summary()
+            pdf.savefig(fig_summary)
+            plt.close(fig_summary)
+            print("✓ Added Executive Summary")
+        except Exception as e:
+            print(f"⚠️  Skipped executive summary (error: {e})")
+
+        # Categorical features
+        for feat in analyzer.categorical_features:
+            try:
+                fig = analyzer.create_categorical_viz(feat)
+                pdf.savefig(fig)
+                plt.close(fig)
+                print(f"✓ Added categorical feature: {feat}")
+            except Exception as e:
+                print(f"⚠️  Skipped {feat} (error: {e})")
+
+        # Numerical features
+        for feat in analyzer.numerical_features:
+            try:
+                fig = analyzer.create_numerical_viz(feat)
+                pdf.savefig(fig)
+                plt.close(fig)
+                print(f"✓ Added numerical feature: {feat}")
+            except Exception as e:
+                print(f"⚠️  Skipped {feat} (error: {e})")
+
+    print(f"\n✅ Multi-Month Drift Report generated successfully: {filename}")
+    return filename
 
     def create_executive_summary(self):
         """Create executive summary page."""
