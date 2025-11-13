@@ -825,3 +825,37 @@ CRITICAL INSIGHTS:
         )
         plt.tight_layout()
         return fig
+
+
+    def get_stability_summary(analyzer):
+    """
+    Return lists of stable, moderately drifting, and highly drifting variables.
+    """
+    stable_vars = []
+    moderate_vars = []
+    high_drift_vars = []
+
+    total_transitions = len(analyzer.months) - 1
+
+    for feat in analyzer.all_features:
+        drift_count = sum(r['drift_detected'] for r in analyzer.monthly_results[feat]['results'])
+        drift_ratio = drift_count / total_transitions
+
+        if drift_ratio <= 0.3:
+            stable_vars.append(feat)
+        elif drift_ratio <= 0.7:
+            moderate_vars.append(feat)
+        else:
+            high_drift_vars.append(feat)
+
+    print("\n=== FEATURE STABILITY SUMMARY ===")
+    print(f"Stable features ({len(stable_vars)}): {stable_vars}")
+    print(f"Moderate drift ({len(moderate_vars)}): {moderate_vars}")
+    print(f"High drift ({len(high_drift_vars)}): {high_drift_vars}")
+    print("=================================\n")
+
+    return {
+        "stable": stable_vars,
+        "moderate": moderate_vars,
+        "high_drift": high_drift_vars
+    }
